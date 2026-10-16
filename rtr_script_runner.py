@@ -35,7 +35,7 @@ OP_CLIENT_SECRET_REF = "op://Credentials/CrowdStrike Primary Patrick/credential"
 REPORT_DIR = pathlib.Path(__file__).parent.resolve() / "audit_reports"
 RUN_TIMESTAMP = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
 OUTPUT_FILE = REPORT_DIR / f"{RUN_TIMESTAMP}__rtr_script_runner.csv"
-LOG_FILE = REPORT_DIR / "api_audit_log.log"
+LOG_FILE = REPORT_DIR / f"{RUN_TIMESTAMP}__rtr_script_runner.log"
 
 # Keep this under 5000 for Hosts API
 API_RESULT_LIMIT = 500
@@ -239,7 +239,7 @@ def get_cloud_scripts(admin_client):
     script_ids = []
     offset = 0
     while True:
-        response = admin_client.list_scripts(limit=API_RESULT_LIMIT, offset=offset)
+        response = admin_client.list_scripts(limit=100, offset=offset)
         if response["status_code"] != 200:
             report_api_failure("Listing RTR scripts (Real Time Response Admin: Write)", response)
             raise RuntimeError("Unable to list RTR scripts.")
