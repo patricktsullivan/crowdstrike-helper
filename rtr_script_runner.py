@@ -17,8 +17,10 @@ import json
 import logging
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import textwrap
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -37,6 +39,9 @@ REPORT_DIR = pathlib.Path(__file__).parent.resolve() / "audit_reports"
 RUN_TIMESTAMP = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
 OUTPUT_FILE = REPORT_DIR / f"{RUN_TIMESTAMP}__rtr_script_runner.csv"
 LOG_FILE = REPORT_DIR / f"{RUN_TIMESTAMP}__rtr_script_runner.log"
+
+# Widest the script name column gets in the script menu
+MENU_NAME_WIDTH = 40
 
 # Keep this under 5000 for Hosts API
 API_RESULT_LIMIT = 500
@@ -64,11 +69,36 @@ REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger(__name__)
 
+LOG_FORMAT = "%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s"
+
 logging.basicConfig(
     level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
+    format=LOG_FORMAT,
     handlers=[logging.FileHandler(LOG_FILE)]
 )
+
+
+def name_reports_for_script(script_name):
+    """Rename this run's log (and the CSV to come) to include the selected script name."""
+    global LOG_FILE, OUTPUT_FILE
+
+    safe_name = re.sub(r"[^\w.-]+", "_", script_name).strip("_") or "script"
+    new_log_file = REPORT_DIR / f"{RUN_TIMESTAMP}__rtr_script_runner__{safe_name}.log"
+    OUTPUT_FILE = REPORT_DIR / f"{RUN_TIMESTAMP}__rtr_script_runner__{safe_name}.csv"
+
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        if isinstance(handler, logging.FileHandler) and pathlib.Path(handler.baseFilename) == LOG_FILE:
+            root_logger.removeHandler(handler)
+            handler.close()
+
+    LOG_FILE.replace(new_log_file)
+    LOG_FILE = new_log_file
+
+    file_handler = logging.FileHandler(LOG_FILE, mode="a")
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    root_logger.addHandler(file_handler)
+    logger.info("Log file renamed to %s", LOG_FILE)
 ###############################################################################
 
 # 1Password CLI Credentials
@@ -282,16 +312,43 @@ def get_cloud_scripts(admin_client):
     return sorted(scripts, key=lambda s: s.get("name", "").lower())
 
 
+def one_line(text):
+    """Collapse line breaks, tabs and repeated spaces into single spaces."""
+    return " ".join((text or "").split())
+
+
+def truncate(text, width):
+    return text if len(text) <= width else text[:width - 3].rstrip() + "..."
+
+
+def print_script_menu(scripts):
+    """Print one aligned row per script, trimmed to the terminal width."""
+    term_width = shutil.get_terminal_size().columns
+    rows = []
+    for idx, script in enumerate(scripts, start=1):
+        platforms = ",".join(script.get("platform") or [])
+        rows.append((f"[{idx:>3}]", one_line(script.get("name")), platforms, one_line(script.get("description"))))
+
+    name_width = min(max(len(r[1]) for r in rows), MENU_NAME_WIDTH)
+    platform_width = max(len("Platform"), max(len(r[2]) for r in rows))
+    prefix_width = 2 + 5 + 2 + name_width + 2 + platform_width + 2
+    desc_width = max(term_width - prefix_width - 1, 10)
+
+    print("\nAvailable Response Scripts:")
+    print(f"  {'#':>5}  {'Name':<{name_width}}  {'Platform':<{platform_width}}  Description")
+    print(f"  {'-' * 5}  {'-' * name_width}  {'-' * platform_width}  {'-' * min(desc_width, 11)}")
+    for num, name, platforms, description in rows:
+        name = truncate(name, name_width)
+        description = truncate(description, desc_width)
+        print(f"  {num}  {name:<{name_width}}  {platforms:<{platform_width}}  {description}")
+
+
 def choose_script(admin_client):
     scripts = get_cloud_scripts(admin_client)
     if not scripts:
         raise RuntimeError("No scripts found in RTR Response Scripts.")
 
-    print("\nAvailable Response Scripts:")
-    for idx, script in enumerate(scripts, start=1):
-        platforms = ", ".join(script.get("platform") or [])
-        description = script.get("description") or ""
-        print(f"  [{idx:>3}] {script['name']}  ({platforms})  {description}")
+    print_script_menu(scripts)
 
     while True:
         choice = input("\nSelect a script by number: ").strip()
@@ -300,7 +357,13 @@ def choose_script(admin_client):
             break
         print("Invalid selection.")
 
-    script_args = input("Script arguments (-CommandLine), leave blank for none: ").strip()
+    description = one_line(script.get("description"))
+    print(f"\nSelected: {one_line(script['name'])}")
+    if description:
+        print(textwrap.fill(description, width=shutil.get_terminal_size().columns - 4,
+                            initial_indent="    ", subsequent_indent="    "))
+
+    script_args = input("\nScript arguments (-CommandLine), leave blank for none: ").strip()
 
     logger.info("Selected script %s (%s) with args %r", script["name"], script.get("id"), script_args)
     return script, script_args
@@ -532,6 +595,7 @@ def main():
 
     # Get Script Choice
     script, script_args = choose_script(admin_rtr_client)
+    name_reports_for_script(script["name"])
     command_string = build_command_string(script["name"], script_args)
 
     target_host_ids, _ = filter_hosts_by_platform(target_host_ids, host_details, script)
