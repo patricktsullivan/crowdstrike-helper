@@ -21,7 +21,7 @@ import sys
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from falconpy import Hosts, RealTimeResponse, RealTimeResponseAdmin
+from falconpy import Hosts, OAuth2, RealTimeResponse, RealTimeResponseAdmin
 
 # Global Setup
 ###############################################################################
@@ -102,22 +102,38 @@ def get_credentials():
 
 # API Init
 ###############################################################################
-# Initialize Falcon API Client
-def init_falcon_client(client_id, client_secret, cid, mode):
-    cs_creds = {
+# Authenticate once and share the token across all service clients
+def authenticate(client_id, client_secret, cid):
+    auth_kwargs = {
                 'client_id': client_id,
                 'client_secret': client_secret,
                 'base_url': BASE_URL,
                 }
     if cid:
-        cs_creds["member_cid"] = cid
+        auth_kwargs["member_cid"] = cid
 
+    auth = OAuth2(**auth_kwargs)
+    response = auth.token()
+    if response["status_code"] not in (200, 201) or not auth.token_value:
+        errors = api_errors(response)
+        logger.error("OAuth2 token request failed (HTTP %s): %s", response["status_code"], errors)
+        raise RuntimeError(
+            f"OAuth2 token request to {BASE_URL} failed with HTTP {response['status_code']}: "
+            f"{format_errors(errors) or auth.token_fail_reason}"
+        )
+
+    logger.info("OAuth2 token obtained from %s (member_cid=%r)", BASE_URL, cid or None)
+    return auth
+
+
+# Initialize Falcon API Client
+def init_falcon_client(auth, mode):
     if mode == "HOSTS":
-        client = Hosts(creds=cs_creds)
+        client = Hosts(auth_object=auth)
     elif mode == "RTR":
-        client = RealTimeResponse(creds=cs_creds)
+        client = RealTimeResponse(auth_object=auth)
     elif mode == "RTR_ADMIN":
-        client = RealTimeResponseAdmin(creds=cs_creds)
+        client = RealTimeResponseAdmin(auth_object=auth)
     else:
         raise ValueError(f"Unknown client mode: {mode}")
     return client
@@ -130,6 +146,24 @@ def api_errors(response):
     """Pull the error list out of an API response."""
     body = response.get("body") or {}
     return body.get("errors") or []
+
+
+def format_errors(errors):
+    """Turn an API error list into a readable one-liner."""
+    if not errors:
+        return ""
+    return "; ".join(f"{e.get('code', '')} {e.get('message', e)}".strip() if isinstance(e, dict) else str(e)
+                     for e in errors)
+
+
+def report_api_failure(action, response):
+    """Log and print a failed API call so 401/403s don't disappear into the log file."""
+    errors = api_errors(response)
+    logger.error("%s failed (HTTP %s): %s", action, response["status_code"], errors)
+    message = f"[!] {action} failed (HTTP {response['status_code']}): {format_errors(errors)}"
+    if response["status_code"] == 403:
+        message += "\n    Check that the API client has the required scope for this call."
+    print(message)
 
 
 def chunk(items, size):
@@ -171,7 +205,7 @@ def validate_input_targets(target_input, host_client):
             limit=API_RESULT_LIMIT,
         )
         if response["status_code"] != 200:
-            logger.error("Lookup failed for %s: %s", hostname, api_errors(response))
+            report_api_failure(f"Hostname lookup for {hostname} (Hosts: Read)", response)
             unresolved.append(hostname)
             continue
 
@@ -196,7 +230,7 @@ def get_host_details(host_client, host_ids):
     for id_chunk in chunk(host_ids, API_RESULT_LIMIT):
         response = host_client.get_device_details(ids=id_chunk)
         if response["status_code"] != 200:
-            logger.error("Device detail lookup failed: %s", api_errors(response))
+            report_api_failure("Device detail lookup (Hosts: Read)", response)
         for device in response["body"].get("resources") or []:
             details[device["device_id"]] = device
 
@@ -215,7 +249,8 @@ def get_cloud_scripts(admin_client):
     while True:
         response = admin_client.list_scripts(limit=API_RESULT_LIMIT, offset=offset)
         if response["status_code"] != 200:
-            raise RuntimeError(f"Unable to list RTR scripts: {api_errors(response)}")
+            report_api_failure("Listing RTR scripts (Real Time Response Admin: Write)", response)
+            raise RuntimeError("Unable to list RTR scripts.")
 
         resources = response["body"].get("resources") or []
         script_ids.extend(resources)
@@ -228,7 +263,8 @@ def get_cloud_scripts(admin_client):
     for id_chunk in chunk(script_ids, API_RESULT_LIMIT):
         response = admin_client.get_scripts_v2(ids=id_chunk)
         if response["status_code"] != 200:
-            raise RuntimeError(f"Unable to get RTR script details: {api_errors(response)}")
+            report_api_failure("Getting RTR script details (Real Time Response Admin: Write)", response)
+            raise RuntimeError("Unable to get RTR script details.")
         scripts.extend(response["body"].get("resources") or [])
 
     return sorted(scripts, key=lambda s: s.get("name", "").lower())
@@ -306,7 +342,7 @@ def run_batch(rtr_client, admin_client, host_ids, command_string, batch_num):
     batch_id = init["body"].get("batch_id")
     if init["status_code"] not in (200, 201) or not batch_id:
         errors = api_errors(init)
-        logger.error("Batch %d: session init failed: %s", batch_num, errors)
+        report_api_failure(f"Batch {batch_num} session init (Real Time Response: Read)", init)
         for result in results.values():
             result["errors"] = errors
         return results
@@ -338,7 +374,7 @@ def run_batch(rtr_client, admin_client, host_ids, command_string, batch_num):
 
     if response["status_code"] not in (200, 201):
         errors = api_errors(response)
-        logger.error("Batch %d: runscript failed: %s", batch_num, errors)
+        report_api_failure(f"Batch {batch_num} runscript (Real Time Response Admin: Write)", response)
         for aid in connected:
             results[aid]["errors"] = errors
         return results
@@ -419,10 +455,16 @@ def main():
     # Get API Credentials
     client_id, client_secret = get_credentials()
 
-    # Initialize API Clients
-    host_client = init_falcon_client(client_id, client_secret, MEMBER_CID, "HOSTS")
-    rtr_client = init_falcon_client(client_id, client_secret, MEMBER_CID, "RTR")
-    admin_rtr_client = init_falcon_client(client_id, client_secret, MEMBER_CID, "RTR_ADMIN")
+    # Authenticate, then initialize API Clients with the shared token
+    try:
+        auth = authenticate(client_id, client_secret, MEMBER_CID)
+    except RuntimeError as e:
+        print(f"[!] {e}")
+        return 1
+
+    host_client = init_falcon_client(auth, "HOSTS")
+    rtr_client = init_falcon_client(auth, "RTR")
+    admin_rtr_client = init_falcon_client(auth, "RTR_ADMIN")
 
     # Get Host Targets (Sensor IDs)
     target_host_ids = get_target_endpoints(host_client)
