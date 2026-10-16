@@ -25,9 +25,6 @@ from falconpy import Hosts, OAuth2, RealTimeResponse, RealTimeResponseAdmin
 
 # Global Setup
 ###############################################################################
-# API Credentials (leave as "___" to pull from 1Password instead)
-CLIENT_ID = "___"
-CLIENT_SECRET = "___"
 BASE_URL = "https://api.laggar.gcw.crowdstrike.com"
 MEMBER_CID = ""
 
@@ -92,11 +89,6 @@ def op_read(reference: str) -> str:
 
 
 def get_credentials():
-    """Use hard-coded credentials if set, otherwise read them from 1Password."""
-    if CLIENT_ID != "___" and CLIENT_SECRET != "___":
-        logger.info("Using hard-coded API credentials.")
-        return CLIENT_ID, CLIENT_SECRET
-
     logger.info("Reading API credentials from 1Password.")
     return op_read(OP_CLIENT_ID_REF), op_read(OP_CLIENT_SECRET_REF)
 
