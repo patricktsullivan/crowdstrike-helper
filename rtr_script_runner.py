@@ -10,6 +10,7 @@
 
 ###############################################################################
 
+import argparse
 import csv
 import datetime
 import json
@@ -49,7 +50,8 @@ MAX_WORKERS = 5
 SCRIPT_TIMEOUT = 600
 # Seconds to wait for sessions to be established
 SESSION_TIMEOUT = 60
-# Queue the script for hosts that are offline. Queued results are not returned by this script.
+# Queue the script for hosts that are offline (or pass --queue-offline).
+# Queued results are not returned by this script.
 QUEUE_OFFLINE = False
 
 # Set Targets here if you'd rather do that than use the CLI
@@ -116,6 +118,24 @@ def authenticate(client_id, client_secret, cid):
 
     logger.info("OAuth2 token obtained from %s (member_cid=%r)", BASE_URL, cid or None)
     return auth
+
+
+def init_cid_rtr_clients(client_id, client_secret, cids, default_auth):
+    """RTR sessions must be opened from the CID that owns the host, so build
+    RTR and RTR Admin clients per CID. Returns {cid: (rtr_client, admin_client)}."""
+    clients = {}
+    for cid in sorted(cids):
+        if cid == MEMBER_CID.lower():
+            auth = default_auth
+        else:
+            try:
+                auth = authenticate(client_id, client_secret, cid)
+            except RuntimeError as e:
+                # Expected for the API client's own CID, which is not a member of itself
+                logger.warning("member_cid auth for %s failed, using default token: %s", cid, e)
+                auth = default_auth
+        clients[cid] = (init_falcon_client(auth, "RTR"), init_falcon_client(auth, "RTR_ADMIN"))
+    return clients
 
 
 # Initialize Falcon API Client
@@ -286,6 +306,27 @@ def choose_script(admin_client):
     return script, script_args
 
 
+def check_script_in_cids(cid_clients, hosts_by_cid, script_name):
+    """Response Scripts are stored per CID; drop CIDs that don't have the chosen script.
+    Returns {aid: error} for the hosts that were dropped."""
+    skipped = {}
+    for cid in list(hosts_by_cid):
+        _, admin_client = cid_clients[cid]
+        try:
+            names = {s.get("name") for s in get_cloud_scripts(admin_client)}
+        except RuntimeError:
+            names = set()
+        if script_name in names:
+            continue
+
+        message = f"Response Script '{script_name}' not found in CID {cid}"
+        logger.warning("%s; skipping %d host(s)", message, len(hosts_by_cid[cid]))
+        print(f"[!] {message}; skipping {len(hosts_by_cid[cid])} host(s).")
+        for aid in hosts_by_cid.pop(cid):
+            skipped[aid] = {"aid": aid, "session_started": False, "errors": message}
+    return skipped
+
+
 def build_command_string(script_name, script_args):
     command = f'runscript -CloudFile="{script_name}"'
     if script_args:
@@ -319,14 +360,14 @@ def filter_hosts_by_platform(host_ids, host_details, script):
 # RTR Functions
 ###############################################################################
 
-def run_batch(rtr_client, admin_client, host_ids, command_string, batch_num):
+def run_batch(rtr_client, admin_client, host_ids, command_string, batch_num, queue_offline):
     """Open a batch session on host_ids and run command_string. Returns {aid: result}."""
     results = {aid: {"aid": aid, "session_started": False} for aid in host_ids}
 
     logger.info("Batch %d: initializing sessions on %d host(s)", batch_num, len(host_ids))
     init = rtr_client.batch_init_sessions(
         host_ids=host_ids,
-        queue_offline=QUEUE_OFFLINE,
+        queue_offline=queue_offline,
         timeout=SESSION_TIMEOUT,
     )
     logger.debug("Batch %d init response: %s", batch_num, json.dumps(init["body"], default=str))
@@ -385,31 +426,40 @@ def run_batch(rtr_client, admin_client, host_ids, command_string, batch_num):
     return results
 
 
-def run_script_on_hosts(rtr_client, admin_client, host_ids, command_string):
-    """Split hosts into batches and run them concurrently."""
-    batches = chunk(host_ids, BATCH_SIZE)
+def run_script_on_hosts(cid_clients, hosts_by_cid, command_string, queue_offline):
+    """Split each CID's hosts into batches and run all batches concurrently."""
+    batches = []
+    for cid, host_ids in sorted(hosts_by_cid.items()):
+        for batch in chunk(host_ids, BATCH_SIZE):
+            batches.append((cid, batch))
     all_results = {}
 
-    print(f"\nRunning across {len(host_ids)} host(s) in {len(batches)} batch session(s)...")
+    host_count = sum(len(b) for _, b in batches)
+    print(f"\nRunning across {host_count} host(s) in {len(hosts_by_cid)} CID(s), "
+          f"{len(batches)} batch session(s)...")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(run_batch, rtr_client, admin_client, batch, command_string, num): num
-            for num, batch in enumerate(batches, start=1)
-        }
+        futures = {}
+        for num, (cid, batch) in enumerate(batches, start=1):
+            rtr_client, admin_client = cid_clients[cid]
+            logger.info("Batch %d: CID %s, %d host(s)", num, cid, len(batch))
+            future = executor.submit(run_batch, rtr_client, admin_client, batch, command_string, num, queue_offline)
+            futures[future] = num
         for future in as_completed(futures):
             num = futures[future]
             try:
                 batch_results = future.result()
             except Exception:
                 logger.exception("Batch %d raised an exception", num)
-                for aid in batches[num - 1]:
+                for aid in batches[num - 1][1]:
                     all_results[aid] = {"aid": aid, "session_started": False, "errors": "exception, see log"}
                 print(f"  Batch {num}: failed (see log)")
                 continue
 
             all_results.update(batch_results)
             done = sum(1 for r in batch_results.values() if r.get("complete"))
-            print(f"  Batch {num}: {done}/{len(batch_results)} host(s) completed")
+            queued = sum(1 for r in batch_results.values() if r.get("offline_queued"))
+            print(f"  Batch {num} (CID {batches[num - 1][0]}): {done}/{len(batch_results)} host(s) completed"
+                  + (f", {queued} queued for offline hosts" if queued else ""))
 
     return all_results
 
@@ -419,7 +469,7 @@ def run_script_on_hosts(rtr_client, admin_client, host_ids, command_string):
 ###############################################################################
 
 def write_results(results, host_details, script_name, command_string):
-    fields = ["aid", "hostname", "platform", "script", "command", "session_started",
+    fields = ["aid", "hostname", "cid", "platform", "script", "command", "session_started",
               "offline_queued", "complete", "stdout", "stderr", "errors", "session_id", "task_id"]
 
     with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as outfile:
@@ -430,10 +480,11 @@ def write_results(results, host_details, script_name, command_string):
             row = {
                 **result,
                 "hostname": device.get("hostname", ""),
+                "cid": device.get("cid", ""),
                 "platform": device.get("platform_name", ""),
                 "script": script_name,
                 "command": command_string,
-                "errors": json.dumps(result.get("errors")) if result.get("errors") else "",
+                "errors": errors if isinstance(errors := result.get("errors"), str) else format_errors(errors),
             }
             writer.writerow(row)
             logger.info("Result for %s (%s): %s", row["hostname"], aid, json.dumps(result, default=str))
@@ -443,7 +494,21 @@ def write_results(results, host_details, script_name, command_string):
 ###############################################################################
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run a cloud Response Script on hosts through RTR batch sessions.")
+    parser.add_argument(
+        "--queue-offline",
+        action="store_true",
+        default=QUEUE_OFFLINE,
+        help="Queue the script for offline hosts to run when they come online (results are not collected).",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    logger.info("queue_offline=%s", args.queue_offline)
+
     # Get API Credentials
     client_id, client_secret = get_credentials()
 
@@ -455,7 +520,6 @@ def main():
         return 1
 
     host_client = init_falcon_client(auth, "HOSTS")
-    rtr_client = init_falcon_client(auth, "RTR")
     admin_rtr_client = init_falcon_client(auth, "RTR_ADMIN")
 
     # Get Host Targets (Sensor IDs)
@@ -475,21 +539,36 @@ def main():
         print("No targets match the script's platform. Exiting.")
         return 1
 
+    # Group hosts by the CID that owns them; RTR must be run from that CID
+    hosts_by_cid = {}
+    for aid in target_host_ids:
+        hosts_by_cid.setdefault(host_details[aid]["cid"].lower(), []).append(aid)
+    cid_clients = init_cid_rtr_clients(client_id, client_secret, hosts_by_cid, auth)
+
+    results = check_script_in_cids(cid_clients, hosts_by_cid, script["name"])
+    target_host_ids = [aid for host_ids in hosts_by_cid.values() for aid in host_ids]
+    if not target_host_ids:
+        write_results(results, host_details, script["name"], command_string)
+        print("No targets left to run against. Exiting.")
+        return 1
+
     print(f"\nAbout to run: {command_string}")
-    print(f"Against {len(target_host_ids)} host(s).")
+    print(f"Against {len(target_host_ids)} host(s) in {len(hosts_by_cid)} CID(s).")
+    if args.queue_offline:
+        print("Offline hosts will have the script queued.")
     if input("Continue? [y/N]: ").strip().lower() != "y":
         logger.info("Run cancelled by user.")
         print("Cancelled.")
         return 0
 
     # Start RTR Batch Sessions with targeted hosts
-    results = run_script_on_hosts(rtr_client, admin_rtr_client, target_host_ids, command_string)
+    results.update(run_script_on_hosts(cid_clients, hosts_by_cid, command_string, args.queue_offline))
 
     # Write results from each session to log
     write_results(results, host_details, script["name"], command_string)
 
     completed = sum(1 for r in results.values() if r.get("complete"))
-    print(f"Completed on {completed}/{len(target_host_ids)} host(s).")
+    print(f"Completed on {completed}/{len(results)} host(s).")
     return 0
 
 if __name__ == "__main__":
