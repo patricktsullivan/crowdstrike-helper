@@ -32,10 +32,11 @@ BASE_URL = "https://api.laggar.gcw.crowdstrike.com"
 MEMBER_CID = ""
 
 # 1Password Credential Target
-OP_CLIENT_ID_REF = "op://Credentials/CrowdStrike Primary Patrick/username"
-OP_CLIENT_SECRET_REF = "op://Credentials/CrowdStrike Primary Patrick/credential"
+# "op://vault/item/section/target"
+OP_CLIENT_ID_REF = ""
+OP_CLIENT_SECRET_REF = ""
 
-REPORT_DIR = pathlib.Path(__file__).parent.resolve() / "audit_reports"
+REPORT_DIR = pathlib.Path(__file__).parent.resolve() / "reports"
 RUN_TIMESTAMP = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
 OUTPUT_FILE = REPORT_DIR / f"{RUN_TIMESTAMP}__rtr_script_runner.csv"
 LOG_FILE = REPORT_DIR / f"{RUN_TIMESTAMP}__rtr_script_runner.log"
